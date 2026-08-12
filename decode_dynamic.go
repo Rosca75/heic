@@ -186,178 +186,6 @@ func decodeDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, err
 	return img, cfg, nil
 }
 
-func init() {
-	if runtime.GOOS == "windows" {
-		dynamic = false
-		dynamicErr = fmt.Errorf("dynamic library loading not supported on windows yet; see https://github.com/gen2brain/heic/issues/11")
-		return
-	}
-
-	var err error
-	defer func() {
-		if r := recover(); r != nil {
-			dynamic = false
-			dynamicErr = fmt.Errorf("%v", r)
-		}
-	}()
-
-	libheif, err = loadLibrary()
-	if err == nil {
-		dynamic = true
-	} else {
-		dynamicErr = err
-
-		return
-	}
-
-	purego.RegisterLibFunc(&_heifGetVersionNumberMajor, libheif, "heif_get_version_number_major")
-	purego.RegisterLibFunc(&_heifGetVersionNumberMinor, libheif, "heif_get_version_number_minor")
-
-	versionMajor = heifGetVersionNumberMajor()
-	versionMinor = heifGetVersionNumberMinor()
-
-	if versionMajor == 1 && versionMinor >= 17 {
-		purego.RegisterLibFunc(&_heifImageHandleGetPreferredDecodingColorspace, libheif, "heif_image_handle_get_preferred_decoding_colorspace")
-	}
-
-	purego.RegisterLibFunc(&_heifImageHandleGetNumberOfThumbnails, libheif, "heif_image_handle_get_number_of_thumbnails")
-	purego.RegisterLibFunc(&_heifImageHandleGetListOfThumbnailIDs, libheif, "heif_image_handle_get_list_of_thumbnail_IDs")
-	purego.RegisterLibFunc(&_heifImageHandleGetThumbnail, libheif, "heif_image_handle_get_thumbnail")
-
-	purego.RegisterLibFunc(&_heifCheckFiletype, libheif, "heif_check_filetype")
-	purego.RegisterLibFunc(&_heifContextAlloc, libheif, "heif_context_alloc")
-	purego.RegisterLibFunc(&_heifContextFree, libheif, "heif_context_free")
-	purego.RegisterLibFunc(&_heifContextReadFromMemoryWithoutCopy, libheif, "heif_context_read_from_memory_without_copy")
-	purego.RegisterLibFunc(&_heifContextGetPrimaryImageHandle, libheif, "heif_context_get_primary_image_handle")
-	purego.RegisterLibFunc(&_heifImageHandleGetWidth, libheif, "heif_image_handle_get_width")
-	purego.RegisterLibFunc(&_heifImageHandleGetHeight, libheif, "heif_image_handle_get_height")
-	purego.RegisterLibFunc(&_heifImageHandleIsPremultipliedAlpha, libheif, "heif_image_handle_is_premultiplied_alpha")
-	purego.RegisterLibFunc(&_heifImageHandleRelease, libheif, "heif_image_handle_release")
-	purego.RegisterLibFunc(&_heifDecodingOptionsAlloc, libheif, "heif_decoding_options_alloc")
-	purego.RegisterLibFunc(&_heifDecodingOptionsFree, libheif, "heif_decoding_options_free")
-	purego.RegisterLibFunc(&_heifDecodeImage, libheif, "heif_decode_image")
-	purego.RegisterLibFunc(&_heifImageGetPlaneReadonly, libheif, "heif_image_get_plane_readonly")
-}
-
-var (
-	libheif uintptr
-
-	dynamic    bool
-	dynamicErr error
-
-	versionMajor int
-	versionMinor int
-)
-
-var (
-	_heifGetVersionNumberMajor                     func() uint32
-	_heifGetVersionNumberMinor                     func() uint32
-	_heifImageHandleGetNumberOfThumbnails          func(*heifImageHandle) int
-	_heifImageHandleGetListOfThumbnailIDs          func(*heifImageHandle, *uint32, int) int
-	_heifImageHandleGetThumbnail                   func(*heifImageHandle, uint32, **heifImageHandle) uintptr
-	_heifCheckFiletype                             func(*uint8, uint64) int
-	_heifContextAlloc                              func() *heifContext
-	_heifContextFree                               func(*heifContext)
-	_heifContextReadFromMemoryWithoutCopy          func(*heifContext, *uint8, uint64, *byte) uintptr
-	_heifContextGetPrimaryImageHandle              func(*heifContext, **heifImageHandle) uintptr
-	_heifImageHandleGetWidth                       func(*heifImageHandle) int
-	_heifImageHandleGetHeight                      func(*heifImageHandle) int
-	_heifImageHandleIsPremultipliedAlpha           func(*heifImageHandle) int
-	_heifImageHandleGetPreferredDecodingColorspace func(*heifImageHandle, *int, *int) uintptr
-	_heifImageHandleRelease                        func(*heifImageHandle)
-	_heifDecodingOptionsAlloc                      func() *heifDecodingOptions
-	_heifDecodingOptionsFree                       func(*heifDecodingOptions)
-	_heifDecodeImage                               func(*heifImageHandle, **heifImage, int, int, *heifDecodingOptions) uintptr
-	_heifImageGetPlaneReadonly                     func(*heifImage, int, *int) *uint8
-)
-
-func heifGetVersionNumberMajor() int {
-	return int(_heifGetVersionNumberMajor())
-}
-
-func heifGetVersionNumberMinor() int {
-	return int(_heifGetVersionNumberMinor())
-}
-
-func heifCheckFiletype(data []byte) int {
-	return _heifCheckFiletype(&data[0], uint64(len(data)))
-}
-
-func heifContextAlloc() *heifContext {
-	return _heifContextAlloc()
-}
-
-func heifContextFree(ctx *heifContext) {
-	_heifContextFree(ctx)
-}
-
-func heifContextReadFromMemoryWithoutCopy(ctx *heifContext, data []byte) heifError {
-	ret := _heifContextReadFromMemoryWithoutCopy(ctx, &data[0], uint64(len(data)), nil)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
-func heifContextGetPrimaryImageHandle(ctx *heifContext, handle **heifImageHandle) heifError {
-	ret := _heifContextGetPrimaryImageHandle(ctx, handle)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
-func heifImageHandleGetWidth(handle *heifImageHandle) int {
-	return _heifImageHandleGetWidth(handle)
-}
-
-func heifImageHandleGetHeight(handle *heifImageHandle) int {
-	return _heifImageHandleGetHeight(handle)
-}
-
-func heifImageHandleIsPremultipliedAlpha(handle *heifImageHandle) bool {
-	ret := _heifImageHandleIsPremultipliedAlpha(handle)
-
-	return ret != 0
-}
-
-func heifImageHandleGetPreferredDecodingColorspace(handle *heifImageHandle, colorspace *int, chroma *int) heifError {
-	ret := _heifImageHandleGetPreferredDecodingColorspace(handle, colorspace, chroma)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
-func heifImageHandleRelease(handle *heifImageHandle) {
-	_heifImageHandleRelease(handle)
-}
-
-func heifDecodingOptionsAlloc() *heifDecodingOptions {
-	return _heifDecodingOptionsAlloc()
-}
-
-func heifDecodingOptionsFree(options *heifDecodingOptions) {
-	_heifDecodingOptionsFree(options)
-}
-
-func heifDecodeImage(handle *heifImageHandle, img **heifImage, colorspace int, chroma int, options *heifDecodingOptions) heifError {
-	ret := _heifDecodeImage(handle, img, colorspace, chroma, options)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
-func heifImageGetPlaneReadonly(img *heifImage, channel int, stride *int) *uint8 {
-	return _heifImageGetPlaneReadonly(img, channel, stride)
-}
-
-func heifImageHandleGetNumberOfThumbnails(h *heifImageHandle) int {
-	return _heifImageHandleGetNumberOfThumbnails(h)
-}
-
-func heifImageHandleGetListOfThumbnailIDs(h *heifImageHandle, ids []uint32) int {
-	return _heifImageHandleGetListOfThumbnailIDs(h, &ids[0], len(ids))
-}
-
-func heifImageHandleGetThumbnail(h *heifImageHandle, id uint32, out **heifImageHandle) heifError {
-	ret := _heifImageHandleGetThumbnail(h, id, out)
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
 func decodeThumbnailDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 	var err error
 	var cfg image.Config
@@ -546,8 +374,73 @@ func decodeThumbnailDynamic(r io.Reader, configOnly bool) (image.Image, image.Co
 	return img, cfg, nil
 }
 
+
+func init() {
+	var err error
+	defer func() {
+		if r := recover(); r != nil {
+			dynamic = false
+			dynamicErr = fmt.Errorf("%v", r)
+		}
+	}()
+
+	libheif, err = loadLibrary()
+	if err == nil {
+		dynamic = true
+	} else {
+		dynamicErr = err
+		return
+	}
+
+	// Register common symbols. Platform-specific files provide the
+	// function-variable declarations with the correct ABI shapes.
+	purego.RegisterLibFunc(&_heifGetVersionNumberMajor, libheif, "heif_get_version_number_major")
+	purego.RegisterLibFunc(&_heifGetVersionNumberMinor, libheif, "heif_get_version_number_minor")
+
+	versionMajor = heifGetVersionNumberMajor()
+	versionMinor = heifGetVersionNumberMinor()
+
+	if versionMajor == 1 && versionMinor >= 17 {
+		purego.RegisterLibFunc(&_heifImageHandleGetPreferredDecodingColorspace, libheif, "heif_image_handle_get_preferred_decoding_colorspace")
+	}
+
+	purego.RegisterLibFunc(&_heifImageHandleGetNumberOfThumbnails, libheif, "heif_image_handle_get_number_of_thumbnails")
+	purego.RegisterLibFunc(&_heifImageHandleGetListOfThumbnailIDs, libheif, "heif_image_handle_get_list_of_thumbnail_IDs")
+	purego.RegisterLibFunc(&_heifImageHandleGetThumbnail, libheif, "heif_image_handle_get_thumbnail")
+
+	purego.RegisterLibFunc(&_heifCheckFiletype, libheif, "heif_check_filetype")
+	purego.RegisterLibFunc(&_heifContextAlloc, libheif, "heif_context_alloc")
+	purego.RegisterLibFunc(&_heifContextFree, libheif, "heif_context_free")
+	purego.RegisterLibFunc(&_heifContextReadFromMemoryWithoutCopy, libheif, "heif_context_read_from_memory_without_copy")
+	purego.RegisterLibFunc(&_heifContextGetPrimaryImageHandle, libheif, "heif_context_get_primary_image_handle")
+	purego.RegisterLibFunc(&_heifImageHandleGetWidth, libheif, "heif_image_handle_get_width")
+	purego.RegisterLibFunc(&_heifImageHandleGetHeight, libheif, "heif_image_handle_get_height")
+	purego.RegisterLibFunc(&_heifImageHandleIsPremultipliedAlpha, libheif, "heif_image_handle_is_premultiplied_alpha")
+	purego.RegisterLibFunc(&_heifImageHandleRelease, libheif, "heif_image_handle_release")
+	purego.RegisterLibFunc(&_heifDecodingOptionsAlloc, libheif, "heif_decoding_options_alloc")
+	purego.RegisterLibFunc(&_heifDecodingOptionsFree, libheif, "heif_decoding_options_free")
+	purego.RegisterLibFunc(&_heifDecodeImage, libheif, "heif_decode_image")
+	purego.RegisterLibFunc(&_heifImageGetPlaneReadonly, libheif, "heif_image_get_plane_readonly")
+}
+
+var (
+	libheif uintptr
+
+	dynamic    bool
+	dynamicErr error
+
+	versionMajor int
+	versionMinor int
+)
+
+// Platform-specific function-variable declarations and small ABI wrappers
+// live in decode_dynamic_other.go and decode_dynamic_windows.go so each
+// platform can implement the correct calling convention (sret on Windows).
+
 type heifContext struct{}
+
 type heifImageHandle struct{}
+
 type heifImage struct{}
 
 type heifError struct {
