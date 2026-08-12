@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
@@ -33,7 +34,6 @@ func decodeWASM(r io.Reader, configOnly bool, exportName string, thumbnail bool)
 	initOnce()
 
 	var cfg image.Config
-	var data []byte
 
 	ctx := context.Background()
 	mod, err := rt.InstantiateModule(ctx, cm, mc.WithName(""))
@@ -42,6 +42,22 @@ func decodeWASM(r io.Reader, configOnly bool, exportName string, thumbnail bool)
 	}
 
 	defer mod.Close(ctx)
+
+	// Delegate to the shared implementation. copyOut is true so the returned
+	// image owns its pixels (the module's memory is freed by the deferred
+	// Close above).
+	return decodeWithModule(ctx, mod, r, configOnly, exportName, thumbnail, true)
+}
+
+// decodeWithModule performs a single decode against an already-instantiated
+// module. When copyOut is true the decoded pixels are copied into a fresh
+// Go-owned buffer (required when the module will be closed or reused before the
+// image is consumed). This is the shared core used by both the per-call
+// decodeWASM path and the reusable Decoder.
+func decodeWithModule(ctx context.Context, mod api.Module, r io.Reader, configOnly bool, exportName string, thumbnail bool, copyOut bool) (image.Image, image.Config, error) {
+	var cfg image.Config
+	var data []byte
+	var err error
 
 	_alloc := mod.ExportedFunction("malloc")
 	_free := mod.ExportedFunction("free")
@@ -204,6 +220,14 @@ func decodeWASM(r io.Reader, configOnly bool, exportName string, thumbnail bool)
 	out, ok := mod.Memory().Read(uint32(outPtr), uint32(size))
 	if !ok {
 		return nil, cfg, ErrMemRead
+	}
+
+	// When copyOut is set, copy the pixels out of WASM linear memory so the
+	// returned image stays valid after the module is closed or reused.
+	if copyOut {
+		buf := make([]byte, len(out))
+		copy(buf, out)
+		out = buf
 	}
 
 	var img image.Image
