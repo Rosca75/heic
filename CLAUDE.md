@@ -135,13 +135,19 @@ there is no export list. It appears in `libheic.go` as `(*module) X<name>`.
 ## Releases and tags
 
 Tags live on **`main`**. Historic fork tags `v0.1.0`/`v0.2.0`/`v0.3.0` were cut on
-feature branches; leave them alone, apps still pin `v0.2.0`.
+feature branches; leave them alone, apps still pin `v0.2.0`. `v0.4.0` — the upstream
+Rust/WASM sync — is the first tagged on `main`, and is where releases go from now on.
 
-**The fork releases on the 1.x line** (`v1.0.0` onward) to stay clear of upstream's
-0.x numbering, which is still advancing (upstream is past v0.7.x). Never reuse a
-version number upstream has. The `upstream` remote is configured with
-`tagOpt = --no-tags` so its tags don't pollute this repo — keep it that way, and don't
-run `git fetch upstream --tags`.
+The fork continues its **own** 0.x sequence, independent of upstream's. Go resolves
+`github.com/Rosca75/heic@vX.Y.Z` against this repo's tags only, so a version number
+also existing upstream does not block it here. The overlap is nonetheless real in
+conversation — upstream is past v0.7.x, so "heic v0.4.0" is ambiguous between the two
+repos. Always say which repo you mean.
+
+The `upstream` remote is configured with `tagOpt = --no-tags` so its tags don't
+pollute this repo. Keep it that way and never run `git fetch upstream --tags`: it
+collides on every shared version number, and a stray upstream tag fetched locally
+will block creating the fork's own tag of the same name.
 
 ## Upstream
 
