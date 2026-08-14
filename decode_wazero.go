@@ -21,11 +21,12 @@ import (
 var heicWasm []byte
 
 type module struct {
-	mod       api.Module
-	alloc     api.Function
-	free      api.Function
-	decode    api.Function
-	decodeSeq api.Function
+	mod         api.Module
+	alloc       api.Function
+	free        api.Function
+	decode      api.Function
+	decodeSeq   api.Function
+	decodeThumb api.Function
 }
 
 var modPool = sync.Pool{New: func() any { return newModule() }}
@@ -39,11 +40,12 @@ func newModule() *module {
 	}
 
 	return &module{
-		mod:       mod,
-		alloc:     mod.ExportedFunction("malloc"),
-		free:      mod.ExportedFunction("free"),
-		decode:    mod.ExportedFunction("decode"),
-		decodeSeq: mod.ExportedFunction("decode_sequence"),
+		mod:         mod,
+		alloc:       mod.ExportedFunction("malloc"),
+		free:        mod.ExportedFunction("free"),
+		decode:      mod.ExportedFunction("decode"),
+		decodeSeq:   mod.ExportedFunction("decode_sequence"),
+		decodeThumb: mod.ExportedFunction("decode_thumbnail"),
 	}
 }
 
@@ -170,6 +172,98 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 		if width == 0 {
 			return nil, image.Config{}, ErrDecode
 		}
+		return nil, cfg, nil
+	}
+
+	outPtr := res[0]
+	if outPtr == 0 {
+		return nil, cfg, ErrDecode
+	}
+	defer m.free.Call(ctx, outPtr)
+
+	size := int(width) * int(height) * 4
+	out, ok := mem.Read(uint32(outPtr), uint32(size))
+	if !ok {
+		return nil, cfg, ErrMemRead
+	}
+
+	img := image.NewNRGBA(image.Rect(0, 0, int(width), int(height)))
+	copy(img.Pix, out)
+
+	return img, cfg, nil
+}
+
+func decodeThumbnail(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+	var cfg image.Config
+
+	// The thumbnail item may live anywhere in the container, so read it all
+	// even when only the config is wanted.
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, cfg, fmt.Errorf("read: %w", err)
+	}
+
+	m := modPool.Get().(*module)
+	defer modPool.Put(m)
+
+	ctx := context.Background()
+	mem := m.mod.Memory()
+
+	inSize := len(data)
+
+	res, err := m.alloc.Call(ctx, uint64(inSize))
+	if err != nil {
+		return nil, cfg, fmt.Errorf("alloc: %w", err)
+	}
+	inPtr := res[0]
+	defer m.free.Call(ctx, inPtr)
+
+	if !mem.Write(uint32(inPtr), data) {
+		return nil, cfg, ErrMemWrite
+	}
+
+	res, err = m.alloc.Call(ctx, 3*4)
+	if err != nil {
+		return nil, cfg, fmt.Errorf("alloc: %w", err)
+	}
+	infoPtr := res[0]
+	defer m.free.Call(ctx, infoPtr)
+
+	cfgOnly := uint64(0)
+	if configOnly {
+		cfgOnly = 1
+	}
+
+	res, err = m.decodeThumb.Call(ctx, inPtr, uint64(inSize), cfgOnly, infoPtr)
+	if err != nil {
+		return nil, cfg, fmt.Errorf("decode_thumbnail: %w", err)
+	}
+
+	width, ok := mem.ReadUint32Le(uint32(infoPtr))
+	if !ok {
+		return nil, cfg, ErrMemRead
+	}
+	height, ok := mem.ReadUint32Le(uint32(infoPtr) + 4)
+	if !ok {
+		return nil, cfg, ErrMemRead
+	}
+	status, ok := mem.ReadUint32Le(uint32(infoPtr) + 8)
+	if !ok {
+		return nil, cfg, ErrMemRead
+	}
+
+	if status == thumbnailAbsent {
+		return nil, cfg, ErrNoThumbnail
+	}
+	if status != thumbnailPresent {
+		return nil, cfg, ErrDecode
+	}
+
+	cfg.Width = int(width)
+	cfg.Height = int(height)
+	cfg.ColorModel = color.NRGBAModel
+
+	if configOnly {
 		return nil, cfg, nil
 	}
 

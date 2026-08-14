@@ -16,9 +16,17 @@ import (
 
 // Errors .
 var (
-	ErrMemRead  = errors.New("heic: mem read failed")
-	ErrMemWrite = errors.New("heic: mem write failed")
-	ErrDecode   = errors.New("heic: decode failed")
+	ErrMemRead     = errors.New("heic: mem read failed")
+	ErrMemWrite    = errors.New("heic: mem write failed")
+	ErrDecode      = errors.New("heic: decode failed")
+	ErrNoThumbnail = errors.New("heic: no thumbnail")
+)
+
+// Status word written by the WASM decode_thumbnail export; any other value,
+// zero included, means the thumbnail decode failed.
+const (
+	thumbnailPresent = 1
+	thumbnailAbsent  = 2
 )
 
 // Decode reads a HEIC image from r; for an image sequence it returns the first frame.
@@ -44,6 +52,32 @@ func Decode(r io.Reader) (image.Image, error) {
 
 	img, _, err := decode(bytes.NewReader(data), false)
 	return img, err
+}
+
+// DecodeThumbnail reads a HEIC image from r and returns its embedded thumbnail.
+// It returns ErrNoThumbnail if the file contains no embedded thumbnail; it never
+// falls back to decoding the primary image.
+func DecodeThumbnail(r io.Reader) (image.Image, error) {
+	if dynamic && !ForceWasmMode {
+		img, _, err := decodeThumbnailDynamic(r, false)
+		return img, err
+	}
+
+	img, _, err := decodeThumbnail(r, false)
+	return img, err
+}
+
+// DecodeThumbnailConfig returns the color model and dimensions of the embedded
+// thumbnail without decoding its pixels. It returns ErrNoThumbnail if the file
+// contains no embedded thumbnail.
+func DecodeThumbnailConfig(r io.Reader) (image.Config, error) {
+	if dynamic && !ForceWasmMode {
+		_, cfg, err := decodeThumbnailDynamic(r, true)
+		return cfg, err
+	}
+
+	_, cfg, err := decodeThumbnail(r, true)
+	return cfg, err
 }
 
 // HEIC holds the decoded frames of a HEIC image sequence and their per-frame delays in seconds.

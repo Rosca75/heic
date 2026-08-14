@@ -21,6 +21,10 @@ func decodeDynamicAll(r io.Reader) (*HEIC, error) {
 	return nil, dynamicErr
 }
 
+func decodeThumbnailDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+	return nil, image.Config{}, dynamicErr
+}
+
 func loadLibrary() (uintptr, error) {
 	return 0, dynamicErr
 }

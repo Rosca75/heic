@@ -112,3 +112,53 @@ pub extern "C" fn decode_sequence(in_ptr: *const u8, in_len: i32, info: *mut u32
 
     p
 }
+
+/// decode_thumbnail writes info[0]=width, info[1]=height, info[2]=status, where
+/// status is 1 = thumbnail present, 2 = no thumbnail, 0 = decode error.
+/// It returns a malloc'd RGBA8 buffer (width*height*4) on success, or null when
+/// config_only != 0, when there is no thumbnail, or on error.
+#[no_mangle]
+pub extern "C" fn decode_thumbnail(
+    in_ptr: *const u8,
+    in_len: i32,
+    config_only: i32,
+    info: *mut u32,
+) -> *mut u8 {
+    let input = unsafe { std::slice::from_raw_parts(in_ptr, in_len as usize) };
+
+    match DecoderConfig::new().decode_thumbnail(input, PixelLayout::Rgba8) {
+        Ok(Some(out)) => {
+            unsafe {
+                *info.add(0) = out.width;
+                *info.add(1) = out.height;
+                *info.add(2) = 1;
+            }
+            if config_only != 0 {
+                return std::ptr::null_mut();
+            }
+            let size = out.data.len();
+            let p = malloc(size);
+            if p.is_null() {
+                return p;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(out.data.as_ptr(), p, size) };
+            p
+        }
+        Ok(None) => {
+            unsafe {
+                *info.add(0) = 0;
+                *info.add(1) = 0;
+                *info.add(2) = 2;
+            }
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            unsafe {
+                *info.add(0) = 0;
+                *info.add(1) = 0;
+                *info.add(2) = 0;
+            }
+            std::ptr::null_mut()
+        }
+    }
+}

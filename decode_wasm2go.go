@@ -84,6 +84,79 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 	return img, cfg, nil
 }
 
+func decodeThumbnail(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+	var cfg image.Config
+
+	mod := modPool.Get().(*module)
+	defer modPool.Put(mod)
+
+	// The thumbnail item may live anywhere in the container, so read it all
+	// even when only the config is wanted.
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, cfg, fmt.Errorf("read: %w", err)
+	}
+
+	inSize := len(data)
+
+	inPtr := mod.Xmalloc(int32(inSize))
+	if inPtr == 0 {
+		return nil, cfg, ErrMemWrite
+	}
+	defer mod.Xfree(inPtr)
+	if !mod.write(inPtr, data) {
+		return nil, cfg, ErrMemWrite
+	}
+
+	info := mod.Xmalloc(3 * 4)
+	if info == 0 {
+		return nil, cfg, ErrMemWrite
+	}
+	defer mod.Xfree(info)
+
+	cfgOnly := int32(0)
+	if configOnly {
+		cfgOnly = 1
+	}
+
+	out := mod.Xdecode_thumbnail(inPtr, int32(inSize), cfgOnly, info)
+
+	width := load32(mod.memory[info:])
+	height := load32(mod.memory[info+4:])
+	status := load32(mod.memory[info+8:])
+
+	if status == thumbnailAbsent {
+		return nil, cfg, ErrNoThumbnail
+	}
+	if status != thumbnailPresent {
+		return nil, cfg, ErrDecode
+	}
+
+	cfg.Width = int(width)
+	cfg.Height = int(height)
+	cfg.ColorModel = color.NRGBAModel
+
+	if configOnly {
+		return nil, cfg, nil
+	}
+
+	if out == 0 {
+		return nil, cfg, ErrDecode
+	}
+	defer mod.Xfree(out)
+
+	size := int(width) * int(height) * 4
+	pix, ok := mod.read(out, int32(size))
+	if !ok {
+		return nil, cfg, ErrMemRead
+	}
+
+	img := image.NewNRGBA(image.Rect(0, 0, int(width), int(height)))
+	copy(img.Pix, pix)
+
+	return img, cfg, nil
+}
+
 func decodeSequence(annexb []byte) ([][]byte, int, int, error) {
 	mod := modPool.Get().(*module)
 	defer modPool.Put(mod)
