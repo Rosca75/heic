@@ -1,8 +1,9 @@
-//go:build (linux || darwin || windows) && !(nodynamic || arm || 386 || mips || mipsle)
+//go:build (linux || darwin || windows) && !(nodynamic || arm || 386 || mips || mipsle || loong64)
 
 package heic
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +12,11 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+)
+
+const (
+	fourccPict             = 0x70696374
+	heifErrorEndOfSequence = 13
 )
 
 func decodeDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
@@ -186,13 +192,190 @@ func decodeDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, err
 	return img, cfg, nil
 }
 
-func init() {
-	if runtime.GOOS == "windows" {
-		dynamic = false
-		dynamicErr = fmt.Errorf("dynamic library loading not supported on windows yet; see https://github.com/gen2brain/heic/issues/11")
-		return
+func decodeThumbnailDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+	var cfg image.Config
+
+	// The thumbnail item may live anywhere in the container, so read it all
+	// even when only the config is wanted.
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, cfg, fmt.Errorf("read: %w", err)
 	}
 
+	check := heifCheckFiletype(data)
+	if check != heifFiletypeYesSupported {
+		return nil, cfg, ErrDecode
+	}
+
+	ctx := heifContextAlloc()
+	defer heifContextFree(ctx)
+
+	var e heifError
+
+	e = heifContextReadFromMemoryWithoutCopy(ctx, data)
+	if e.Code != 0 {
+		return nil, cfg, ErrDecode
+	}
+
+	handle := new(heifImageHandle)
+
+	e = heifContextGetPrimaryImageHandle(ctx, &handle)
+	if e.Code != 0 {
+		return nil, cfg, ErrDecode
+	}
+	defer heifImageHandleRelease(handle)
+
+	if heifImageHandleGetNumberOfThumbnails(handle) == 0 {
+		return nil, cfg, ErrNoThumbnail
+	}
+
+	ids := make([]uint32, 1)
+	if heifImageHandleGetListOfThumbnailIDs(handle, ids) == 0 {
+		return nil, cfg, ErrNoThumbnail
+	}
+
+	thumb := new(heifImageHandle)
+
+	e = heifImageHandleGetThumbnail(handle, ids[0], &thumb)
+	if e.Code != 0 {
+		return nil, cfg, ErrDecode
+	}
+	defer heifImageHandleRelease(thumb)
+
+	cfg.Width = heifImageHandleGetWidth(thumb)
+	cfg.Height = heifImageHandleGetHeight(thumb)
+
+	isPremultiplied := heifImageHandleIsPremultipliedAlpha(thumb)
+
+	var colorspace, chroma int
+	if versionMajor == 1 && versionMinor >= 17 {
+		e = heifImageHandleGetPreferredDecodingColorspace(thumb, &colorspace, &chroma)
+		if e.Code != 0 {
+			return nil, cfg, ErrDecode
+		}
+
+		if colorspace == heifColorspaceUndefined || chroma == heifChromaUndefined {
+			colorspace = heifColorspaceYCbCr
+			chroma = heifChroma420
+			cfg.ColorModel = color.YCbCrModel
+		}
+		if colorspace == heifColorspaceRGB {
+			chroma = heifChromaInterleavedRGBA
+			if isPremultiplied {
+				cfg.ColorModel = color.RGBAModel
+			} else {
+				cfg.ColorModel = color.NRGBAModel
+			}
+		}
+	} else {
+		colorspace = heifColorspaceYCbCr
+		chroma = heifChroma420
+		cfg.ColorModel = color.YCbCrModel
+	}
+
+	if configOnly {
+		return nil, cfg, nil
+	}
+
+	options := heifDecodingOptionsAlloc()
+	options.ConvertHdrTo8bit = 1
+	defer heifDecodingOptionsFree(options)
+
+	heifImg := new(heifImage)
+
+	e = heifDecodeImage(thumb, &heifImg, colorspace, chroma, options)
+	if e.Code != 0 {
+		return nil, cfg, ErrDecode
+	}
+
+	var img image.Image
+	rect := image.Rect(0, 0, cfg.Width, cfg.Height)
+
+	switch colorspace {
+	case heifColorspaceYCbCr:
+		var subsampleRatio image.YCbCrSubsampleRatio
+		switch chroma {
+		case heifChroma420:
+			subsampleRatio = image.YCbCrSubsampleRatio420
+		case heifChroma422:
+			subsampleRatio = image.YCbCrSubsampleRatio422
+		case heifChroma444:
+			subsampleRatio = image.YCbCrSubsampleRatio444
+		}
+
+		var yStride, uStride int
+		y := heifImageGetPlaneReadonly(heifImg, heifChannelY, &yStride)
+		cb := heifImageGetPlaneReadonly(heifImg, heifChannelCb, &uStride)
+		cr := heifImageGetPlaneReadonly(heifImg, heifChannelCr, &uStride)
+
+		_, _, _, ch := yCbCrSize(rect, subsampleRatio)
+		i0 := yStride * cfg.Height
+		i1 := yStride*cfg.Height + 1*uStride*ch
+		i2 := yStride*cfg.Height + 2*uStride*ch
+		b := make([]byte, i2)
+
+		i := &image.YCbCr{
+			Y:              b[:i0:i0],
+			Cb:             b[i0:i1:i1],
+			Cr:             b[i1:i2:i2],
+			SubsampleRatio: subsampleRatio,
+			YStride:        yStride,
+			CStride:        uStride,
+			Rect:           rect,
+		}
+
+		copy(i.Y, unsafe.Slice(y, yStride*cfg.Height))
+		copy(i.Cb, unsafe.Slice(cb, uStride*ch))
+		copy(i.Cr, unsafe.Slice(cr, uStride*ch))
+
+		img = i
+	case heifColorspaceMonochrome:
+		var stride int
+		grayData := heifImageGetPlaneReadonly(heifImg, heifChannelY, &stride)
+		size := cfg.Height * stride
+
+		i := &image.Gray{
+			Pix:    make([]uint8, size),
+			Stride: stride,
+			Rect:   rect,
+		}
+
+		copy(i.Pix, unsafe.Slice(grayData, size))
+		img = i
+	case heifColorspaceRGB:
+		var stride int
+		rgbaData := heifImageGetPlaneReadonly(heifImg, heifChannelInterleaved, &stride)
+		size := cfg.Height * stride
+
+		if isPremultiplied {
+			i := &image.RGBA{
+				Pix:    make([]uint8, size),
+				Stride: stride,
+				Rect:   rect,
+			}
+
+			copy(i.Pix, unsafe.Slice(rgbaData, size))
+			img = i
+		} else {
+			i := &image.NRGBA{
+				Pix:    make([]uint8, size),
+				Stride: stride,
+				Rect:   rect,
+			}
+
+			copy(i.Pix, unsafe.Slice(rgbaData, size))
+			img = i
+		}
+	default:
+		return nil, cfg, fmt.Errorf("unsupported colorspace %d", colorspace)
+	}
+
+	runtime.KeepAlive(data)
+
+	return img, cfg, nil
+}
+
+func init() {
 	var err error
 	defer func() {
 		if r := recover(); r != nil {
@@ -233,35 +416,76 @@ func init() {
 	purego.RegisterLibFunc(&_heifDecodingOptionsFree, libheif, "heif_decoding_options_free")
 	purego.RegisterLibFunc(&_heifDecodeImage, libheif, "heif_decode_image")
 	purego.RegisterLibFunc(&_heifImageGetPlaneReadonly, libheif, "heif_image_get_plane_readonly")
+
+	purego.RegisterLibFunc(&_heifImageHandleGetNumberOfThumbnails, libheif, "heif_image_handle_get_number_of_thumbnails")
+	purego.RegisterLibFunc(&_heifImageHandleGetListOfThumbnailIDs, libheif, "heif_image_handle_get_list_of_thumbnail_IDs")
+	purego.RegisterLibFunc(&_heifImageHandleGetThumbnail, libheif, "heif_image_handle_get_thumbnail")
+
+	if versionMajor == 1 && versionMinor >= 19 {
+		registerSequence()
+	}
+}
+
+func registerSequence() {
+	defer func() {
+		if recover() != nil {
+			hasSequence = false
+		}
+	}()
+
+	purego.RegisterLibFunc(&_heifContextNumberOfSequenceTracks, libheif, "heif_context_number_of_sequence_tracks")
+	purego.RegisterLibFunc(&_heifContextGetTrackIds, libheif, "heif_context_get_track_ids")
+	purego.RegisterLibFunc(&_heifContextGetTrack, libheif, "heif_context_get_track")
+	purego.RegisterLibFunc(&_heifTrackGetTrackHandlerType, libheif, "heif_track_get_track_handler_type")
+	purego.RegisterLibFunc(&_heifTrackGetTimescale, libheif, "heif_track_get_timescale")
+	purego.RegisterLibFunc(&_heifTrackRelease, libheif, "heif_track_release")
+	purego.RegisterLibFunc(&_heifTrackDecodeNextImage, libheif, "heif_track_decode_next_image")
+	purego.RegisterLibFunc(&_heifImageGetDuration, libheif, "heif_image_get_duration")
+	purego.RegisterLibFunc(&_heifImageGetPrimaryWidth, libheif, "heif_image_get_primary_width")
+	purego.RegisterLibFunc(&_heifImageGetPrimaryHeight, libheif, "heif_image_get_primary_height")
+	purego.RegisterLibFunc(&_heifImageRelease, libheif, "heif_image_release")
+
+	hasSequence = true
 }
 
 var (
 	libheif uintptr
 
-	dynamic    bool
-	dynamicErr error
+	dynamic     bool
+	dynamicErr  error
+	hasSequence bool
 
 	versionMajor int
 	versionMinor int
 )
 
 var (
-	_heifGetVersionNumberMajor                     func() uint32
-	_heifGetVersionNumberMinor                     func() uint32
-	_heifCheckFiletype                             func(*uint8, uint64) int
-	_heifContextAlloc                              func() *heifContext
-	_heifContextFree                               func(*heifContext)
-	_heifContextReadFromMemoryWithoutCopy          func(*heifContext, *uint8, uint64, *byte) uintptr
-	_heifContextGetPrimaryImageHandle              func(*heifContext, **heifImageHandle) uintptr
-	_heifImageHandleGetWidth                       func(*heifImageHandle) int
-	_heifImageHandleGetHeight                      func(*heifImageHandle) int
-	_heifImageHandleIsPremultipliedAlpha           func(*heifImageHandle) int
-	_heifImageHandleGetPreferredDecodingColorspace func(*heifImageHandle, *int, *int) uintptr
-	_heifImageHandleRelease                        func(*heifImageHandle)
-	_heifDecodingOptionsAlloc                      func() *heifDecodingOptions
-	_heifDecodingOptionsFree                       func(*heifDecodingOptions)
-	_heifDecodeImage                               func(*heifImageHandle, **heifImage, int, int, *heifDecodingOptions) uintptr
-	_heifImageGetPlaneReadonly                     func(*heifImage, int, *int) *uint8
+	_heifGetVersionNumberMajor           func() uint32
+	_heifGetVersionNumberMinor           func() uint32
+	_heifCheckFiletype                   func(*uint8, uint64) int
+	_heifContextAlloc                    func() *heifContext
+	_heifContextFree                     func(*heifContext)
+	_heifImageHandleGetWidth             func(*heifImageHandle) int
+	_heifImageHandleGetHeight            func(*heifImageHandle) int
+	_heifImageHandleIsPremultipliedAlpha func(*heifImageHandle) int
+	_heifImageHandleRelease              func(*heifImageHandle)
+	_heifDecodingOptionsAlloc            func() *heifDecodingOptions
+	_heifDecodingOptionsFree             func(*heifDecodingOptions)
+	_heifImageGetPlaneReadonly           func(*heifImage, int, *int) *uint8
+
+	_heifImageHandleGetNumberOfThumbnails func(*heifImageHandle) int
+	_heifImageHandleGetListOfThumbnailIDs func(*heifImageHandle, *uint32, int) int
+
+	_heifContextNumberOfSequenceTracks func(*heifContext) int
+	_heifContextGetTrackIds            func(*heifContext, *uint32)
+	_heifContextGetTrack               func(*heifContext, uint32) *heifTrack
+	_heifTrackGetTrackHandlerType      func(*heifTrack) uint32
+	_heifTrackGetTimescale             func(*heifTrack) uint32
+	_heifTrackRelease                  func(*heifTrack)
+	_heifImageGetDuration              func(*heifImage) uint32
+	_heifImageGetPrimaryWidth          func(*heifImage) int
+	_heifImageGetPrimaryHeight         func(*heifImage) int
+	_heifImageRelease                  func(*heifImage)
 )
 
 func heifGetVersionNumberMajor() int {
@@ -284,18 +508,6 @@ func heifContextFree(ctx *heifContext) {
 	_heifContextFree(ctx)
 }
 
-func heifContextReadFromMemoryWithoutCopy(ctx *heifContext, data []byte) heifError {
-	ret := _heifContextReadFromMemoryWithoutCopy(ctx, &data[0], uint64(len(data)), nil)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
-func heifContextGetPrimaryImageHandle(ctx *heifContext, handle **heifImageHandle) heifError {
-	ret := _heifContextGetPrimaryImageHandle(ctx, handle)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
 func heifImageHandleGetWidth(handle *heifImageHandle) int {
 	return _heifImageHandleGetWidth(handle)
 }
@@ -310,14 +522,16 @@ func heifImageHandleIsPremultipliedAlpha(handle *heifImageHandle) bool {
 	return ret != 0
 }
 
-func heifImageHandleGetPreferredDecodingColorspace(handle *heifImageHandle, colorspace *int, chroma *int) heifError {
-	ret := _heifImageHandleGetPreferredDecodingColorspace(handle, colorspace, chroma)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
 func heifImageHandleRelease(handle *heifImageHandle) {
 	_heifImageHandleRelease(handle)
+}
+
+func heifImageHandleGetNumberOfThumbnails(handle *heifImageHandle) int {
+	return _heifImageHandleGetNumberOfThumbnails(handle)
+}
+
+func heifImageHandleGetListOfThumbnailIDs(handle *heifImageHandle, ids []uint32) int {
+	return _heifImageHandleGetListOfThumbnailIDs(handle, &ids[0], len(ids))
 }
 
 func heifDecodingOptionsAlloc() *heifDecodingOptions {
@@ -328,19 +542,159 @@ func heifDecodingOptionsFree(options *heifDecodingOptions) {
 	_heifDecodingOptionsFree(options)
 }
 
-func heifDecodeImage(handle *heifImageHandle, img **heifImage, colorspace int, chroma int, options *heifDecodingOptions) heifError {
-	ret := _heifDecodeImage(handle, img, colorspace, chroma, options)
-
-	return *(*heifError)(unsafe.Pointer(&ret))
-}
-
 func heifImageGetPlaneReadonly(img *heifImage, channel int, stride *int) *uint8 {
 	return _heifImageGetPlaneReadonly(img, channel, stride)
+}
+
+func heifContextNumberOfSequenceTracks(ctx *heifContext) int {
+	return _heifContextNumberOfSequenceTracks(ctx)
+}
+
+func heifContextGetTrackIds(ctx *heifContext, ids *uint32) {
+	_heifContextGetTrackIds(ctx, ids)
+}
+
+func heifContextGetTrack(ctx *heifContext, id uint32) *heifTrack {
+	return _heifContextGetTrack(ctx, id)
+}
+
+func heifTrackGetTrackHandlerType(t *heifTrack) uint32 {
+	return _heifTrackGetTrackHandlerType(t)
+}
+
+func heifTrackGetTimescale(t *heifTrack) uint32 {
+	return _heifTrackGetTimescale(t)
+}
+
+func heifTrackRelease(t *heifTrack) {
+	_heifTrackRelease(t)
+}
+
+func heifImageGetDuration(img *heifImage) uint32 {
+	return _heifImageGetDuration(img)
+}
+
+func heifImageGetPrimaryWidth(img *heifImage) int {
+	return _heifImageGetPrimaryWidth(img)
+}
+
+func heifImageGetPrimaryHeight(img *heifImage) int {
+	return _heifImageGetPrimaryHeight(img)
+}
+
+func heifImageRelease(img *heifImage) {
+	_heifImageRelease(img)
+}
+
+// decodeDynamicAll decodes a HEIC image sequence via libheif, or a single frame when there is no sequence.
+func decodeDynamicAll(r io.Reader) (*HEIC, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+
+	if _, ok := parseSequence(data); ok {
+		if hasSequence {
+			ctx := heifContextAlloc()
+			defer heifContextFree(ctx)
+
+			if e := heifContextReadFromMemoryWithoutCopy(ctx, data); e.Code == 0 {
+				if h, ok := decodeSequenceDynamic(ctx); ok {
+					runtime.KeepAlive(data)
+					return h, nil
+				}
+			}
+		}
+
+		// libheif has no sequence support; decode the sequence via WASM.
+		return decodeWasmAll(bytes.NewReader(data))
+	}
+
+	img, _, err := decodeDynamic(bytes.NewReader(data), false)
+	if err != nil {
+		return nil, err
+	}
+
+	return &HEIC{Image: []image.Image{img}, Delay: []float64{0}}, nil
+}
+
+// decodeSequenceDynamic iterates the visual (pict) track, returning each frame as NRGBA with its delay in seconds.
+func decodeSequenceDynamic(ctx *heifContext) (*HEIC, bool) {
+	n := heifContextNumberOfSequenceTracks(ctx)
+	if n <= 0 {
+		return nil, false
+	}
+
+	ids := make([]uint32, n)
+	heifContextGetTrackIds(ctx, &ids[0])
+
+	var track *heifTrack
+	for _, id := range ids {
+		t := heifContextGetTrack(ctx, id)
+		if t == nil {
+			continue
+		}
+		if heifTrackGetTrackHandlerType(t) == fourccPict {
+			track = t
+			break
+		}
+		heifTrackRelease(t)
+	}
+	if track == nil {
+		return nil, false
+	}
+	defer heifTrackRelease(track)
+
+	timescale := heifTrackGetTimescale(track)
+	if timescale == 0 {
+		timescale = 1
+	}
+
+	options := heifDecodingOptionsAlloc()
+	options.ConvertHdrTo8bit = 1
+	defer heifDecodingOptionsFree(options)
+
+	h := &HEIC{}
+	for {
+		var himg *heifImage
+		e := heifTrackDecodeNextImage(track, &himg, heifColorspaceRGB, heifChromaInterleavedRGBA, options)
+		if e.Code == heifErrorEndOfSequence {
+			break
+		}
+		if e.Code != 0 {
+			break
+		}
+
+		w := heifImageGetPrimaryWidth(himg)
+		ht := heifImageGetPrimaryHeight(himg)
+
+		var stride int
+		plane := heifImageGetPlaneReadonly(himg, heifChannelInterleaved, &stride)
+		if plane != nil && w > 0 && ht > 0 {
+			src := unsafe.Slice(plane, stride*ht)
+			img := image.NewNRGBA(image.Rect(0, 0, w, ht))
+			for y := 0; y < ht; y++ {
+				copy(img.Pix[y*img.Stride:y*img.Stride+w*4], src[y*stride:y*stride+w*4])
+			}
+
+			h.Image = append(h.Image, img)
+			h.Delay = append(h.Delay, float64(heifImageGetDuration(himg))/float64(timescale))
+		}
+
+		heifImageRelease(himg)
+	}
+
+	if len(h.Image) == 0 {
+		return nil, false
+	}
+
+	return h, true
 }
 
 type heifContext struct{}
 type heifImageHandle struct{}
 type heifImage struct{}
+type heifTrack struct{}
 
 type heifError struct {
 	Code    uint32

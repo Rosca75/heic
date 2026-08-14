@@ -1,0 +1,7 @@
+# Rust build output for the WASM shim (lib/lib.rs).
+# The committed artifacts are lib/heic.wasm.gz and the generated libheic.go.
+lib/target/
+
+# Local-only HEIC samples used by TestDecodeThumbnailLocal, which skips when they
+# are absent. Upstream's small fixtures (test.heic, gray.heic, ...) are committed.
+testdata/IMG_*.HEIC

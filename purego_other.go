@@ -1,4 +1,4 @@
-//go:build (!linux && !darwin && !windows) || android || nodynamic || arm || 386 || mips || mipsle
+//go:build (!linux && !darwin && !windows) || android || nodynamic || arm || 386 || mips || mipsle || loong64
 
 package heic
 
@@ -14,6 +14,14 @@ var (
 )
 
 func decodeDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+	return nil, image.Config{}, dynamicErr
+}
+
+func decodeDynamicAll(r io.Reader) (*HEIC, error) {
+	return nil, dynamicErr
+}
+
+func decodeThumbnailDynamic(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 	return nil, image.Config{}, dynamicErr
 }
 
